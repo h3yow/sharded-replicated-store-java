@@ -183,6 +183,33 @@ public final class Replica {
         return lastConsistentIndex;
     }
 
+    /**
+     * 丢弃提交位点之后的全部未决（从未确认）条目，使本副本日志尾部恰好停在
+     * commitIndex。用于“写入失败后安全重提”：失败条目绝不能留在任何副本上，
+     * 否则后续同步/重启可能让它重新可见。已确认前缀（index &le; commitIndex）
+     * 原样保留，状态机不变。
+     *
+     * @return 被丢弃的条目数
+     */
+    public synchronized int abortUncommittedTail() throws IOException {
+        long tail = currentTailIndex();
+        long aborted = tail - commitIndex;
+        if (aborted > 0) {
+            persistentLog.truncateSuffix(commitIndex);
+            this.lastConsistentIndex = currentTailIndex();
+            this.corrupted = false;
+            this.corruptionReason = null;
+            log.warn("[{}][{}] 中止未确认尾部: 截断 index>{} 共 {} 条（已确认数据保留，状态机不变）",
+                    shardId, replicaId, commitIndex, aborted);
+        }
+        return (int) aborted;
+    }
+
+    /** 在线同步发生提交点之后分叉截断后，刷新内存中的一致位点缓存。 */
+    synchronized void refreshTailAfterTruncation() throws IOException {
+        this.lastConsistentIndex = currentTailIndex();
+    }
+
     public boolean isCorrupted() {
         return corrupted;
     }

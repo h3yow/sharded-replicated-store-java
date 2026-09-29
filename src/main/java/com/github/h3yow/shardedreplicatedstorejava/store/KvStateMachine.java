@@ -53,7 +53,8 @@ public final class KvStateMachine {
                 return false;
             }
         }
-        data.put(entry.key(), new VersionedValue(entry.value(), entry.version()));
+        data.put(entry.key(), new VersionedValue(entry.value(), entry.version(),
+                entry.winnerRequestId()));
         return true;
     }
 

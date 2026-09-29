@@ -5,9 +5,13 @@
 - 按键（CRC32 哈希）分片，**分片区间与副本归属可动态调整（再平衡）**；
 - 写入在**多数派副本确认**后才对外可见；
 - **重复提交**幂等、不重复应用、不版本回退；
+- **写入失败后用新请求标识安全重提**：失败值被物理中止，重启/追赶/再平衡后都不会复活；
+- **不声明批次，普通写入接口也能对同键并发决胜**：胜出值只由本批提交内容决定，
+  每个客户端拿到可区分的结论（COMMITTED / SUPERSEDED）；
 - 重启后**日志重放**，落后副本**追赶**；
 - 截断 / 缺号 / 乱序 / 校验和损坏的日志**不会被静默跳过**，恢复停在最后一个一致位点；
-- 同一键的并发写入，最终版本**确定且可复现**。
+- 同一键的并发写入，最终版本**确定且可复现**；
+- 上述结论在**整集群重启、副本追赶、分片归属重新划分（含中途失败）之后依然成立**。
 
 全程只依赖 JDK（`java.util`、`java.util.concurrent`、CRC32、文件 IO）与 Spring Boot
 测试设施，**不需要任何外部服务或真实凭据**。
@@ -28,9 +32,10 @@
 | `KvStateMachine` / `VersionedValue` | 键值状态机：顺序应用、版本单调、拒绝回退 |
 | `Replica` | 单个分片副本：日志 + 状态机 + 提交位点 + 可用性模拟 + 重启恢复 |
 | `ReplicaCatchup` | 在线同步（只追加缺失后缀）与恢复性追赶（截断分叉/损坏后对齐） |
-| `ShardReplicaSet` | 一个分片的多数派写入协调、requestId 幂等、提交传播 |
-| `IdempotencyTable` | requestId -> 首次结论的持久化去重表 |
-| `DeterministicLock` | 互斥 + 批量严格全序（按 requestId 排序放行） |
+| `ShardReplicaSet` | 一个分片的多数派写入协调、requestId 幂等、提交传播、失败尾部安全中止 |
+| `IdempotencyTable` | requestId -> 首次结论的持久化去重表（含成功/失败/落败，随键再平衡迁移） |
+| `ContentionGate` | 普通写入路径的同键并发决胜门（无需声明批大小，两段式自适应安静窗口） |
+| `DeterministicLock` | 互斥 + 批量严格全序（按 requestId 排序放行），供显式批次接口使用 |
 | `Cluster` | 门面：路由写入/读取、再平衡编排、整集群重启、副本追赶 |
 | `TopologyManager` | 拓扑文件的解析、校验、临时文件 + 原子替换 |
 
@@ -76,30 +81,78 @@
   - `COMMITTED`：多数派确认，对外可见；
   - `REPLICA_UNAVAILABLE`：leader 不可用，或集群中 UP 副本数本身凑不够多数派；
   - `INSUFFICIENT_ACKS`：副本在线但本轮确认数不足多数派（条目未提交、不可见）；
+  - `SUPERSEDED`：同键并发决胜落败（见 2.5），不复制、不占版本、不可见；
   - `DUPLICATE`：同一 requestId 重复提交，返回首次结论。
 - **只有提交位点之前的日志会被应用到状态机并对外可见**；未达多数派的条目即使在
   leader 落盘，也不会被读取到。
 
-### 2.3 幂等与版本
+### 2.3 幂等、版本与“失败后安全重提”
 
-- `requestId -> 首次 WriteResult` 持久化在每分片的 `idempotency.txt`。
-- 重复提交（无论首次是成功还是失败、无论重试时携带什么 value）都返回首次结论，
-  **不产生第二条日志、不重复应用、不回退版本**。
+- `requestId -> 首次 WriteResult` 持久化在每分片的 `idempotency.txt`，结论记录还
+  携带该请求写入的 `key`（供再平衡时随键迁移）。
+- 重复提交（无论首次是成功、失败还是并发落败、无论重试时携带什么 value）都返回
+  首次结论（`DUPLICATE` 包装），**不产生第二条日志、不重复应用、不回退版本**。
 - 每个键的 `version` 在状态机内单调递增：
   - 更大 version 才覆盖；
   - 相同 version（重复迁移）幂等忽略；
   - 更小 version 直接抛错，杜绝回退。
+- **安全重提规则（重点新增）**：一次写入因副本掉线 / 确认数不足失败后，
+  在下一次提交尝试之前，协调者会先执行 **失败尾部安全中止**：
+  1. leader 把自己日志里“提交位点之后”的未决条目**物理截断**；
+  2. 每个在线 follower 走一次以 leader 为准的逐 index 对齐，提交点之后若持有
+     上一轮失败条目（与截断后的 leader 分叉）则截断并补齐，**已确认前缀不动**；
+  3. 仍 DOWN/SLOW 的副本此刻无法处理，等其恢复后由在线同步的分叉截断或恢复性
+     追赶清掉同一条失败尾部。
 
-### 2.4 并发写入的确定性
+  于是：**换一个新 requestId 重提同一 key 时，成功值严格以更大版本对外可见；
+  之前失败提交的值，无论副本之后怎么同步、集群怎么重启、分片怎么调整，都不会再被
+  任何读取看到**（它从不进入提交位点，且日志尾部被物理移除）。旧的失败 requestId
+  本身继续保留第一次的失败结论，重提它只得到 `DUPLICATE`，不会被当成新的成功提交，
+  也不会重复应用。
 
-- 普通 `write` 路径用 `DeterministicLock` 保证临界区互斥，因此日志 index 分配、
-  版本递增、提交位点推进都是原子的，多副本不会出现重复/缺号。
-- 对“同一键并发写最终版本必须可复现”，提供批量严格全序接口
-  `Cluster.writeInBatch(requestId, key, value, batchSize)`：本批竞争者到齐前只排队，
-  到齐后严格按 **requestId 升序**逐个提交。于是 index、version、最终值与线程调度
-  完全无关，重复运行逐次一致。
-- 说明：在没有外部屏障时，任何锁都无法预知“尚未到达的更小请求”，因此“与到达顺序
-  无关的严格全序”必须由调用方声明批大小（对应真实系统中的一次并发提交批次）。
+### 2.4 同键并发写入的决胜（两条路径）
+
+现在提供两条互不冲突的路径：
+
+**（A）普通写入接口即可决胜（新增，无需声明批次）**——直接调用
+`Cluster.write(requestId, key, value)`。分片内的 `ContentionGate` 会自动把
+“同一时刻挤进来的同键写请求”识别为一批：
+
+- 封轮后，本批 **requestId 字典序最大者获胜**，胜出值只由这批提交的内容决定，
+  与线程调度、请求到达先后、副本处理顺序无关；重复运行结果一致；
+- 成员按 requestId 升序逐个进入分片临界区分配连续 index / 单调 version，因此
+  不会出现版本重复、跳号、回退，也不会有 index 冲突；
+- 每个客户端结论可区分：恰好 1 个 `COMMITTED`，其余全部 `SUPERSEDED`
+  （不复制、不占版本、不可见）。`COMMITTED` 客户端随后读到的一定是自己的值；
+  落败者用自己的 requestId 重提只会得到 `DUPLICATE`（首次落败结论被持久化）。
+
+轮次识别采用**两段式自适应安静窗口**（没有外部屏障时，“同一批”本质上只能按时间
+上的并发关系识别）：
+
+1. *探测窗口*：轮次里第一个请求先等一个很短的探测窗口（默认 2ms，
+   `-Dcontention.probe.millis`），窗口内没有后来者即判定为无竞争单独写，立即放行
+   ——顺序写几乎不付额外延迟；
+2. *批次窗口*：一旦出现竞争者就升级为批次模式，此后每来一个新竞争者都把安静窗口
+   重新计时，必须连续一个批次窗口（默认 200ms，`-Dcontention.cohort.grace.millis`）
+   没有新竞争者才封轮。该窗口按“覆盖十几路线程同时被唤醒时的操作系统调度抖动”
+   取值，单 JVM 压测（同 key 十几路并发）下不会把一批拆成多批、不会死锁或超时。
+
+> 局限（如实说明）：纯时间窗口是单 JVM 教学模拟里的启发式归组，不是形式化屏障。
+> 极端过载（调度抖动超过批次窗口）理论上仍可能拆批；需要零时间依赖的严格全序时，
+> 请用下面的显式批次接口。
+
+**（B）显式批次严格全序（原有，保留兼容）**——
+`Cluster.writeInBatch(requestId, key, value, batchSize)`：调用方声明本批竞争者数，
+`DeterministicLock` 在竞争者到齐前只排队，到齐后严格按 requestId 升序逐个提交，
+不做 SUPERSEDED 判定（同批每个请求都成为一个顺序版本）。这与（A）的差异是：
+（B）由调用方给出精确批次边界，结论零时间依赖；（A）无需任何调用方信息，由系统按
+并发关系自动归组并只让最大者胜出。
+
+### 2.5 胜出值的归属标识
+
+每个可见值额外记录 `winnerRequestId`（产生该值的原始请求标识）：普通 PUT 等于
+本条 requestId；再平衡 MIGRATE 沿用迁移前的胜者。因此“最终胜出值属于哪个请求”
+跨世代、跨重启保持不变，可用于断言“某客户端拿到成功且最终读到的确实是自己的值”。
 
 ---
 
@@ -114,11 +167,16 @@
 3. 打开新分片副本集；按新拓扑把每个键路由到新分片，以 `MIGRATE` 日志条目追加，
    并要求**新分片多数派确认**；迁移沿用原值与原 version（不重生版本、不回退）。
    键按字典序迁移，保证崩溃后重放顺序一致；同一逻辑键只迁移一次。
-4. 全部键迁移成功后，新拓扑写入 `*.staged` 临时文件，再 `ATOMIC_MOVE` 替换
-   `topology.txt`，对外原子切换世代。中途任一步失败都不会替换拓扑文件。
-5. 旧分片目录保留不删，迁移过程可追溯、可重放。
+4. 全部键迁移成功后，**再把每个旧分片幂等表中的 requestId 首次结论（成功 / 失败 /
+   并发落败）按其写入 key 的新归属登记到新分片去重表**——保证调整归属后，用旧
+   requestId（包括失败请求）重提仍然是 `DUPLICATE`，不会被当成新提交；
+5. 数据与去重结论都迁移成功后，新拓扑写入 `*.staged` 临时文件，再 `ATOMIC_MOVE`
+   替换 `topology.txt`，对外原子切换世代。中途任一步失败（含非法目标拓扑）都不会
+   替换拓扑文件，旧拓扑与旧的已确认数据原样保留；
+6. 旧分片目录保留不删，迁移过程可追溯、可重放。
 
-由此保证：调整过程中**已确认数据不丢失、不重复、不会落到错误分片**。
+由此保证：调整过程中**已确认数据不丢失、不重复、不会落到错误分片；requestId 的
+首次结论（含失败值的结论）不改变；失败提交的值不会借再平衡重新可见**。
 
 ---
 
@@ -129,8 +187,11 @@
 每行一条，制表符分隔，键/值/requestId 做 Base64 编码，行首是**整行载荷的 CRC32**：
 
 ```
-crc=<校验和>  idx=<日志index>  term=<世代>  req=<base64 requestId>  type=PUT|MIGRATE  ver=<键版本>  key=<b64>  val=<b64>
+crc=<校验和>  idx=<日志index>  term=<世代>  req=<base64 requestId>  type=PUT|MIGRATE  ver=<键版本>  key=<b64>  val=<b64>  win=<b64 胜者requestId>
 ```
+
+无 `win` 字段的旧格式日志仍可解析（胜者取该条目自身 requestId）；幂等表
+`idempotency.txt` 同样在 `req` 之后增加了 `key` 字段，旧 8 字段行也能载入。
 
 ### 4.2 重启重放
 
@@ -177,24 +238,31 @@ mvn -q compile
 mvn test
 
 # 只跑某一类场景
-mvn test -Dtest=TopologyChangeTest     # 分片变更：重叠/空洞/越界拒绝 + 合法再平衡不丢数据
-mvn test -Dtest=WriteConsensusTest     # 多数派、确认不足/副本不可用区分、重复提交幂等
-mvn test -Dtest=LogRecoveryTest        # 截断/缺号/乱序/校验和损坏、停点、追赶
-mvn test -Dtest=ConcurrentWriteTest    # 同键并发写入最终版本确定可复现
+mvn test -Dtest=TopologyChangeTest               # 分片变更：重叠/空洞/越界拒绝 + 合法再平衡不丢数据
+mvn test -Dtest=WriteConsensusTest               # 多数派、确认不足/副本不可用区分、重复提交幂等
+mvn test -Dtest=LogRecoveryTest                  # 截断/缺号/乱序/校验和损坏、停点、追赶
+mvn test -Dtest=ConcurrentWriteTest              # 显式批次：同键并发最终版本确定可复现
+mvn test -Dtest=SafeRetryAfterFailureTest        # 失败后换新 requestId 安全重提、失败值不复活
+mvn test -Dtest=ContentionArbitrationTest        # 普通接口同键并发决胜（15 路×20 轮等）
+mvn test -Dtest=ReshardRestartConsistencyTest    # 重启+再平衡+追赶后的最终一致性
 ```
 
-测试位于 `src/test/java/.../tests/`，共 4 类 15 个用例，使用 JUnit 5 临时目录，
+测试位于 `src/test/java/.../tests/`，共 7 类 42 个用例，使用 JUnit 5 临时目录，
 不落任何外部状态。**单测日志会打印位点（index/commit）、版本（version）与判定依据**，
 例如：
 
 ```
 [s1] 写入提交 requestId=req-2 key=alpha index=2 version=2 acks=2/3（判定依据: 多数派落盘）
-[判定依据] 区间重叠 -> OVERLAPPING_RANGES ...
-[s1][r1] 日志损坏，恢复停在 index=4，原因=TRUNCATED_ENTRY ...
-[位点/版本] 日志位点顺序 == requestId 字典序: [req-01, req-02, ...]
+同键决胜封轮 key=hot 批次大小=15 升序=[req-001, ..., req-015] 胜者=req-015（判定依据: requestId 字典序最大）
+[s1][r1] 在线同步发现提交点之后的分叉，截断到 index=1（丢弃失败提交残留 1 条，不影响已确认数据 commit=1）
+[判定依据] 再平衡+重启后重提 req-fail 仍为 DUPLICATE，可见值保持 retry-wins
 ```
 
-可通过调整日志级别观察更细的复制/追赶过程（默认 INFO 已含关键结论）。
+并发决胜的归组安静窗口可用系统属性临时调大/调小复现边界行为：
+
+```bash
+mvn test -Dtest=ContentionArbitrationTest -DargLine="-Dcontention.cohort.grace.millis=300"
+```
 
 ### 5.1 场景与结论对照
 
@@ -211,7 +279,14 @@ mvn test -Dtest=ConcurrentWriteTest    # 同键并发写入最终版本确定可
 | 缺号/乱序 | `missingIndexAndOutOfOrderAreDetectedAtCorrectStopPoint` | 分别 `MISSING_INDEX` / `INDEX_OUT_OF_ORDER` |
 | 校验和损坏 | `checksumMismatchIsDetectedAndNeverApplied` | `CHECKSUM_MISMATCH`，被篡改条目不应用 |
 | 宕机后追赶 | `laggingReplicaCatchesUpAfterDowntime` | 补齐缺失并重新参与多数派 |
-| 并发确定性 | `concurrentWritesToSameKeyProduceDeterministicFinalVersion` 等 | 多次运行 index/version/最终值完全一致 |
+| 并发确定性（显式批次） | `concurrentWritesToSameKeyProduceDeterministicFinalVersion` 等 | 多次运行 index/version/最终值完全一致 |
+| 失败后安全重提 | `failedValueNeverResurfacesAfterSafeRetryWithNewRequestId` | 新 requestId 以更大版本成功；失败值在追赶/重启后不复活；旧 requestId 永远 DUPLICATE |
+| 确认不足后安全重提 | `insufficientAcksFailureIsAlsoAbortedBeforeSafeRetry` | 失败尾部被中止，重提位点从 1 连续无跳号 |
+| 普通接口同键决胜 | `ordinaryWriteArbitratesSameKeyConcurrentlyWithoutBatchHint`（15 路×20 轮） | 恰好 1 个 COMMITTED，其余 SUPERSEDED，版本=1，不死锁/超时 |
+| 决胜多次可复现 | `repeatedRunsAlwaysConvergeToSameWinnerAcrossIndependentDirectories` | 多次独立运行最终胜者/值/版本完全一致 |
+| 决胜后顺序写单调 | `sequentialWritesAfterContentionKeepMonotonicVersions` | 版本继续 +1，不回退不跳号 |
+| 重启+再平衡+追赶一致 | `winnerValueVersionOwnerAndWinnerRequestIdSurviveRestartAndReshardAndCatchup` | 值/版本/胜者/归属调整前后一致，失败值不复活 |
+| 再平衡中途失败 | `failedReshardKeepsCommittedDataIntact` | 非法拓扑被拒绝，epoch 与已确认数据原样保留 |
 
 ---
 
@@ -221,7 +296,11 @@ mvn test -Dtest=ConcurrentWriteTest    # 同键并发写入最终版本确定可
 
 - 单 leader、无真实选举；副本“可用性”通过 `ReplicaStatus`（UP/SLOW/DOWN）注入。
 - 复制为同步派发模型，不模拟网络延迟/分区/真实并发日志协商；在线同步利用“同 term
-  单 leader 不会在已提交区间分叉”的不变量。
+  单 leader 不会在已提交区间分叉”的不变量，提交点之后的分叉只可能来自失败提交，
+  安全中止 / 在线同步会将其截断。
 - 每次追加后直接关闭文件以模拟落盘（fsync 语义），追求结论清晰而非吞吐。
-- “与到达顺序无关的严格并发全序”通过显式批次（`writeInBatch`）表达；普通写入
-  路径保证互斥与结论自洽，但首个请求的先后仍取决于提交时刻（与真实系统一致）。
+- 普通写入路径的同键决胜通过“两段式自适应安静窗口”自动归组，不要求调用方声明批
+  大小；这是单 JVM 的启发式（默认探测 2ms / 批次 200ms，可调），极端过载下不保证
+  形式化的批次边界。需要零时间依赖的严格全序时使用显式批次接口
+  `writeInBatch`（与原有用法完全兼容，同批每个请求仍各占一个顺序版本，不做
+  SUPERSEDED 判定）。

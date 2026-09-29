@@ -10,15 +10,19 @@ import java.util.zip.CRC32;
  * <ul>
  *   <li>{@code index}：分片日志内的位置，必须从 1 开始严格连续；</li>
  *   <li>{@code term}：协调者世代（拓扑 epoch）；</li>
- *   <li>{@code requestId}：客户端提交 ID，用于重复提交识别；</li>
+ *   <li>{@code requestId}：本条目的客户端提交 ID，用于重复提交识别；</li>
+ *   <li>{@code winnerRequestId}：键的当前可见值最初由哪个请求决胜产生。
+ *       普通 PUT 时等于 {@code requestId}；再平衡 MIGRATE 沿用迁移前的胜者，
+ *       保证“胜出值归属哪个请求”跨世代、跨重启不改变；</li>
  *   <li>{@code version}：键的新版本号，状态机仅接受更大的版本。</li>
  * </ul>
  *
- * <p>单行文本格式（字段以制表符分隔，键/值做 Base64 编码，行首为载荷 CRC32）：</p>
- * <pre>crc=CHECKSUM  idx=..  term=..  req=..  type=PUT  ver=..  key=..  val=..</pre>
+ * <p>单行文本格式（字段以制表符分隔，字符串做 Base64 编码，行首为载荷 CRC32）：</p>
+ * <pre>crc=CHECKSUM  idx=..  term=..  req=..  type=PUT  ver=..  key=..  val=..  win=..</pre>
+ * <p>无 {@code win} 字段的旧格式行仍可解析，此时胜者退化为该条目自身的 requestId。</p>
  */
 public record LogEntry(long index, long term, String requestId, EntryType type,
-                       String key, String value, long version) {
+                       String key, String value, long version, String winnerRequestId) {
 
     public static final long NO_VERSION = -1L;
 
@@ -29,16 +33,22 @@ public record LogEntry(long index, long term, String requestId, EntryType type,
         if (requestId == null || type == null || key == null) {
             throw new IllegalArgumentException("requestId/type/key must not be null");
         }
+        if (winnerRequestId == null || winnerRequestId.isEmpty()) {
+            winnerRequestId = requestId;
+        }
     }
 
     public static LogEntry put(long index, long term, String requestId,
                                String key, String value, long version) {
-        return new LogEntry(index, term, requestId, EntryType.PUT, key, value, version);
+        return new LogEntry(index, term, requestId, EntryType.PUT, key, value, version,
+                requestId);
     }
 
     public static LogEntry migrate(long index, long term, String requestId,
-                                   String key, String value, long version) {
-        return new LogEntry(index, term, requestId, EntryType.MIGRATE, key, value, version);
+                                   String key, String value, long version,
+                                   String winnerRequestId) {
+        return new LogEntry(index, term, requestId, EntryType.MIGRATE, key, value, version,
+                winnerRequestId);
     }
 
     private static String b64(String raw) {
@@ -64,17 +74,19 @@ public record LogEntry(long index, long term, String requestId, EntryType type,
                 "type=" + type.name(),
                 "ver=" + version,
                 "key=" + b64(key),
-                "val=" + b64(value == null ? "" : value));
+                "val=" + b64(value == null ? "" : value),
+                "win=" + b64(winnerRequestId));
         return "crc=" + checksum(payload) + "\t" + payload;
     }
 
     /**
      * 从单行解析。格式错误抛 {@link LogCorruptionException}（MALFORMED_LINE），
      * 校验和不匹配抛 CHECKSUM_MISMATCH；index 连续性由日志扫描层负责。
+     * 旧格式（无 win 字段，共 8 段）仍可解析，胜者取该条目自身的 requestId。
      */
     public static LogEntry deserialize(String line) {
         String[] parts = line.split("\t", -1);
-        if (parts.length != 8 || !parts[0].startsWith("crc=")) {
+        if ((parts.length != 8 && parts.length != 9) || !parts[0].startsWith("crc=")) {
             throw new LogCorruptionException(LogCorruptionReason.MALFORMED_LINE,
                     -1, -1, "日志行列结构不合法: " + abbreviate(line));
         }
@@ -99,7 +111,11 @@ public record LogEntry(long index, long term, String requestId, EntryType type,
             String key = unb64(field(parts[6], "key"));
             String rawValue = unb64(field(parts[7], "val"));
             String value = rawValue.isEmpty() ? null : rawValue;
-            return new LogEntry(index, term, requestId, type, key, value, version);
+            String winnerRequestId = parts.length == 9
+                    ? unb64(field(parts[8], "win"))
+                    : requestId;
+            return new LogEntry(index, term, requestId, type, key, value, version,
+                    winnerRequestId);
         } catch (RuntimeException e) {
             throw new LogCorruptionException(LogCorruptionReason.MALFORMED_LINE,
                     -1, -1, "日志行字段无法解析: " + abbreviate(line) + " (" + e + ")");

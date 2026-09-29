@@ -185,7 +185,8 @@ public final class Cluster {
                     + newTopology.epoch() + ":" + key;
             long index = targetSet.leader().lastLogIndex() + 1;
             LogEntry entry = LogEntry.migrate(index, newTopology.epoch(),
-                    migrateRequestId, key, vv.value(), vv.version());
+                    migrateRequestId, key, vv.value(), vv.version(),
+                    vv.winnerRequestId());
 
             int acks = targetSet.leader().append(entry) ? 1 : 0;
             for (Replica replica : targetSet.replicas()) {
@@ -213,12 +214,52 @@ public final class Cluster {
                     targetSet.replicas().size());
         }
 
-        // 3) 全部迁移完成：staged 新拓扑文件并原子替换。
+        // 3) 随键迁移 requestId 首次结论（含成功、失败、并发落败）。
+        //    requestId 结论与其写入的 key 同归属：按新拓扑把每个旧分片的结案记录
+        //    登记到 key 的新分片去重表，使再平衡后用旧 requestId 重提仍是 DUPLICATE。
+        //    必须在拓扑文件切换前完成，失败则整体不切换、旧数据原样保留。
+        int adoptedOutcomes = 0;
+        for (ShardRange oldRange : oldTopology.ranges()) {
+            ShardReplicaSet oldSet = shardSets.get(oldRange.shardId());
+            if (oldSet == null) {
+                continue;
+            }
+            for (WriteResult outcome : oldSet.allOutcomes()) {
+                // 再平衡自身产生的 migrate@ 记录不面向客户端，无需迁移。
+                if (outcome.requestId().startsWith("migrate@")) {
+                    continue;
+                }
+                // 结论按其写入 key 的新归属迁移；旧格式结论缺 key 时无法安全定位，跳过。
+                if (outcome.key() == null || outcome.key().isEmpty()) {
+                    continue;
+                }
+                ShardRange target = newTopology.shardForKey(outcome.key());
+                if (target == null) {
+                    continue;
+                }
+                ShardReplicaSet targetSet = shardSets.get(target.shardId());
+                WriteResult relocated = new WriteResult(outcome.status(),
+                        target.shardId(), outcome.requestId(),
+                        outcome.logIndex(), outcome.version(),
+                        outcome.acks(), outcome.quorum(),
+                        outcome.decisionReason()
+                                + "（再平衡自分片 " + oldRange.shardId()
+                                + " 迁移，requestId 首次结论保持 " + outcome.status() + "）");
+                if (targetSet.adoptOutcomeIfAbsent(relocated)) {
+                    adoptedOutcomes++;
+                }
+            }
+        }
+        log.info("幂等结论随键迁移: 登记 {} 条首次结论到新分片去重表（成功/失败/落败均保留）",
+                adoptedOutcomes);
+
+        // 4) 全部迁移完成：staged 新拓扑文件并原子替换。
         Path staged = dataDir.resolve("topology.epoch" + newTopology.epoch() + ".staged");
         new TopologyManager(staged).save(newTopology);
         topologyManager.commitSwap(staged);
         topology = newTopology;
-        log.info("== 再平衡完成: 已迁移键数={} 当前 epoch={}", migrated, topology.epoch());
+        log.info("== 再平衡完成: 已迁移键数={} 迁移首次结论={} 当前 epoch={}",
+                migrated, adoptedOutcomes, topology.epoch());
         return migrated;
     }
 

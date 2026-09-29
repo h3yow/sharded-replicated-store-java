@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Base64;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -52,6 +53,31 @@ public final class IdempotencyTable {
         return table.get(requestId);
     }
 
+    /** 本分片全部已结案请求的首次结论（再平衡时按 requestId 迁移去重用）。 */
+    public synchronized java.util.Collection<WriteResult> allOutcomes() {
+        return List.copyOf(table.values());
+    }
+
+    /**
+     * 再平衡迁移专用：把“产生某键当前可见值的原始提交结论”登记到新分片的
+     * 幂等表（保留原 requestId、原位点/版本结论）。只在该 requestId 尚未在
+     * 新分片结案时写入；已是结论则不动（幂等），绝不覆盖已有首次结论。
+     *
+     * @return true 表示实际登记
+     */
+    public synchronized boolean adoptIfAbsent(WriteResult original) throws IOException {
+        if (table.containsKey(original.requestId())) {
+            return false;
+        }
+        try (BufferedWriter w = Files.newBufferedWriter(file, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
+            w.write(serialize(original));
+            w.newLine();
+        }
+        table.put(original.requestId(), original);
+        return true;
+    }
+
     /** 仅在首次见到该 requestId 时结案；并发重复提交由副本集的有序锁挡住。 */
     public synchronized void put(WriteResult result) throws IOException {
         if (table.containsKey(result.requestId())) {
@@ -83,6 +109,7 @@ public final class IdempotencyTable {
                 "status=" + r.status().name(),
                 "shard=" + b64(r.shardId()),
                 "req=" + b64(r.requestId()),
+                "key=" + b64(r.key() == null ? "" : r.key()),
                 "idx=" + r.logIndex(),
                 "ver=" + r.version(),
                 "acks=" + r.acks(),
@@ -92,19 +119,29 @@ public final class IdempotencyTable {
 
     static WriteResult deserialize(String line) {
         String[] p = line.split("\t", -1);
-        if (p.length != 8) {
+        if (p.length != 9 && p.length != 8) {
             throw new IllegalStateException("幂等表行格式损坏: " + line);
         }
         try {
             WriteStatus status = WriteStatus.valueOf(p[0].substring("status=".length()));
             String shard = unb64(p[1].substring("shard=".length()));
             String req = unb64(p[2].substring("req=".length()));
-            long idx = Long.parseLong(p[3].substring("idx=".length()));
-            long ver = Long.parseLong(p[4].substring("ver=".length()));
-            int acks = Integer.parseInt(p[5].substring("acks=".length()));
-            int quorum = Integer.parseInt(p[6].substring("quorum=".length()));
-            String reason = unb64(p[7].substring("reason=".length()));
-            return new WriteResult(status, shard, req, idx, ver, acks, quorum, reason);
+            // 新格式第 4 段为 key；旧格式（无 key）从 idx 段开始。
+            String key;
+            int base;
+            if (p.length == 9 && p[3].startsWith("key=")) {
+                key = unb64(p[3].substring("key=".length()));
+                base = 3;
+            } else {
+                key = null;
+                base = 2;
+            }
+            long idx = Long.parseLong(p[base + 1].substring("idx=".length()));
+            long ver = Long.parseLong(p[base + 2].substring("ver=".length()));
+            int acks = Integer.parseInt(p[base + 3].substring("acks=".length()));
+            int quorum = Integer.parseInt(p[base + 4].substring("quorum=".length()));
+            String reason = unb64(p[base + 5].substring("reason=".length()));
+            return new WriteResult(status, shard, req, key, idx, ver, acks, quorum, reason);
         } catch (RuntimeException e) {
             throw new IllegalStateException("幂等表行无法解析: " + line, e);
         }
