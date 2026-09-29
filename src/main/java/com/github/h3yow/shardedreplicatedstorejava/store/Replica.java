@@ -111,9 +111,41 @@ public final class Replica {
     }
 
     /**
-     * 协调者派发写入时使用：原子地（1）补齐 follower 缺失的 leader 已提交后缀，
-     * （2）追加本轮条目。在副本内置锁内串行，对并发派发幂等，保证日志既不缺号
-     * 也不重复。不推进提交位点（提交由多数派协调者在达成后统一推进）。
+     * 丢弃本地日志中 index &gt; {@code committedInclusive} 的<strong>未提交</strong>
+     * 后缀（物理截断），并刷新最后一致位点。
+     *
+     * <p>用途：某一轮写入未获多数派确认时，条目可能已经落在 leader 或部分 follower
+     * 本地（甚至跨重启仍在）。这些条目永远不会被提交；下一轮用<strong>新 requestId</strong>
+     * 重提同一 key 时，必须先在每个参与副本上把这类残留清掉，再从已提交位点之后重新
+     * 追加，否则残留会被当作缺失后缀同步给其他副本、越过提交判定被状态机应用，
+     * 造成“失败值复活、新值被同版本幂等忽略”。</p>
+     *
+     * <p>状态机只应用到 {@code commitIndex}，而 {@code committedInclusive} 取协调者
+     * （leader）的提交位点（单调不降、且不小于本副本 commit），因此截断不动任何已确认
+     * 数据，已确认值不丢、不重。</p>
+     *
+     * @return 截断后的最后一致位点
+     */
+    public synchronized long discardUncommittedSuffix(long committedInclusive) throws IOException {
+        long tailBefore = lastConsistentIndex;
+        if (tailBefore > committedInclusive) {
+            persistentLog.truncateSuffix(committedInclusive);
+            PersistentLog.ScanResult scan = persistentLog.scanWithReport();
+            this.lastConsistentIndex = scan.lastConsistentIndex();
+            this.corrupted = !scan.clean();
+            this.corruptionReason = scan.reason();
+            log.info("[{}][{}] 丢弃未提交残留后缀: index {}..{} 截断（基点 commit={}，判定依据: 未达多数派的条目永不提交，新 requestId 重提前清场）",
+                    shardId, replicaId, committedInclusive + 1, tailBefore, committedInclusive);
+        }
+        return lastConsistentIndex;
+    }
+
+    /**
+     * 协调者派发写入时使用：原子地（1）清掉本副本所有未提交残留（index &gt; leader
+     * commitIndex，它们只可能来自此前失败轮次），（2）补齐 follower 缺失的 leader
+     * <em>已提交</em>后缀，（3）追加本轮条目。在副本内置锁内串行，保证日志既不缺号
+     * 也不重复、失败值绝不混入已提交前缀。不推进提交位点（提交由多数派协调者在达成后
+     * 统一推进）。
      *
      * @return true 表示本轮条目最终存在于本副本日志
      */
@@ -126,18 +158,41 @@ public final class Replica {
             return false;
         }
         try {
-            if (currentTailIndex() >= entry.index()) {
-                return true;
-            }
+            // 1) 清场：本副本上任何高于 leader 提交位点的条目都来自失败轮次
+            //    （无论本轮是否重启过），先物理丢弃，杜绝失败值被对齐逻辑带走。
+            long leaderCommit = leader.commitIndex();
+            discardUncommittedSuffix(leaderCommit);
+            // 2) 对齐已提交后缀（不截断已提交区间、不推进本副本 commit）。
             ReplicaCatchup.alignCommittedSuffix(this, leader);
             this.lastConsistentIndex = currentTailIndex();
             if (lastConsistentIndex >= entry.index()) {
+                // 对齐后已持有同一位点条目：必须与本轮条目逐字段一致，否则说明
+                // 已提交区间发生分叉（同 term 单 leader 不变量被破坏），拒绝静默混用。
+                LogEntry local = persistentLog.scanWithReport()
+                        .prefix().get((int) entry.index() - 1);
+                if (!sameEntry(local, entry)) {
+                    throw new IllegalStateException("在线同步发现已提交区间分叉: index="
+                            + entry.index() + " 本地 requestId=" + local.requestId()
+                            + " 本轮 requestId=" + entry.requestId()
+                            + " (" + shardId + "/" + replicaId + ")");
+                }
                 return true;
             }
+            // 3) 追加本轮条目（紧接已提交前缀，index 连续、version 单调）。
             return append(entry);
         } catch (IOException e) {
             throw new IllegalStateException("syncAndAppend 失败 " + dir, e);
         }
+    }
+
+    private static boolean sameEntry(LogEntry a, LogEntry b) {
+        return a.index() == b.index()
+                && a.term() == b.term()
+                && a.type() == b.type()
+                && a.requestId().equals(b.requestId())
+                && a.key().equals(b.key())
+                && java.util.Objects.equals(a.value(), b.value())
+                && a.version() == b.version();
     }
 
     /**
@@ -289,6 +344,17 @@ public final class Replica {
         } catch (IOException e) {
             throw new IllegalStateException("提交位点重置失败 " + commitFile, e);
         }
+    }
+
+    /**
+     * 测试/运维支持：把本副本模拟为“落后到 {@code index}（含）位点”——物理截断其后的
+     * 全部日志并把提交位点钳制到该位点、重建状态机。随后应通过
+     * {@link #catchUpFrom(Replica)} 追赶。
+     */
+    public synchronized void simulateLagBehind(long index) throws IOException {
+        persistentLog.truncateSuffix(index);
+        resetCommitIndexForCatchup(index);
+        recover();
     }
 
     PersistentLog persistentLog() {

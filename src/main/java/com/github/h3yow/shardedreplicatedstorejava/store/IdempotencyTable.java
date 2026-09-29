@@ -87,12 +87,15 @@ public final class IdempotencyTable {
                 "ver=" + r.version(),
                 "acks=" + r.acks(),
                 "quorum=" + r.quorum(),
+                "pos=" + r.contestPosition(),
+                "size=" + r.contestSize(),
+                "winner=" + b64(r.winnerRequestId() == null ? "" : r.winnerRequestId()),
                 "reason=" + b64(r.decisionReason()));
     }
 
     static WriteResult deserialize(String line) {
         String[] p = line.split("\t", -1);
-        if (p.length != 8) {
+        if (p.length != 11 && p.length != 8) {
             throw new IllegalStateException("幂等表行格式损坏: " + line);
         }
         try {
@@ -103,8 +106,22 @@ public final class IdempotencyTable {
             long ver = Long.parseLong(p[4].substring("ver=".length()));
             int acks = Integer.parseInt(p[5].substring("acks=".length()));
             int quorum = Integer.parseInt(p[6].substring("quorum=".length()));
-            String reason = unb64(p[7].substring("reason=".length()));
-            return new WriteResult(status, shard, req, idx, ver, acks, quorum, reason);
+            int pos = -1;
+            int size = 0;
+            String winner = null;
+            String reason;
+            if (p.length == 11) {
+                pos = Integer.parseInt(p[7].substring("pos=".length()));
+                size = Integer.parseInt(p[8].substring("size=".length()));
+                String winnerRaw = unb64(p[9].substring("winner=".length()));
+                winner = winnerRaw.isEmpty() ? null : winnerRaw;
+                reason = unb64(p[10].substring("reason=".length()));
+            } else {
+                // 旧格式（决胜字段引入前）：reason 是第 8 段。
+                reason = unb64(p[7].substring("reason=".length()));
+            }
+            return new WriteResult(status, shard, req, idx, ver, acks, quorum,
+                    pos, size, winner, reason);
         } catch (RuntimeException e) {
             throw new IllegalStateException("幂等表行无法解析: " + line, e);
         }

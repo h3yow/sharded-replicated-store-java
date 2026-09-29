@@ -75,14 +75,17 @@ public final class ReplicaCatchup {
 
     /**
      * 写入前在线同步：把 follower 缺失的、leader 上<strong>已提交</strong>的连续
-     * 后缀补齐。不截断、不推进 follower 的提交位点（状态机重放由随后的提交传播
-     * 统一完成）。已提交区间不可能与 leader 分叉，因此只需顺序追加，安全无缺号。
+     * 后缀补齐（严格止于 {@code leader.commitIndex()}，绝不会把 leader 上仍在途、
+     * 尚未获得多数派的条目同步过去）。不截断已提交区间、不推进 follower 的提交位点
+     * （状态机重放由随后的提交传播统一完成）。调用方需先自行丢弃本副本上 index 超过
+     * leader 提交位点的未提交残留（见 {@link Replica#discardUncommittedSuffix}），
+     * 那些残留属于此前失败轮次，不得通过本方法进入其他副本。
      *
      * @return 实际追加的条目数
      */
     public static int alignCommittedSuffix(Replica follower, Replica leader)
             throws IOException {
-        List<LogEntry> leaderEntries = leader.logEntries();
+        long leaderCommit = Math.min(leader.commitIndex(), leader.logEntries().size());
         PersistentLog.ScanResult scan = follower.persistentLog().scanWithReport();
         if (!scan.clean()) {
             throw new LogCorruptionException(scan.reason(), scan.lineNumber(),
@@ -93,17 +96,20 @@ public final class ReplicaCatchup {
                             + ")，需先执行恢复性追赶");
         }
         int appended = 0;
-        for (LogEntry e : leaderEntries) {
+        for (LogEntry e : leader.logEntries()) {
             if (e.index() <= scan.lastConsistentIndex()) {
                 continue;
+            }
+            if (e.index() > leaderCommit) {
+                continue; // 在途条目未提交：在线同步绝不捎带
             }
             follower.persistentLog().append(e);
             appended++;
         }
         if (appended > 0) {
-            log.info("[{}][{}] 在线同步: followerTail={} 对齐 leader 尾部追加 {} 条（不截断、不推进commit）",
+            log.info("[{}][{}] 在线同步: followerTail={} 对齐 leader 已提交位点 {} 追加 {} 条（不截断、不推进commit）",
                     follower.shardId(), follower.replicaId(),
-                    scan.lastConsistentIndex(), appended);
+                    scan.lastConsistentIndex(), leaderCommit, appended);
         }
         return appended;
     }

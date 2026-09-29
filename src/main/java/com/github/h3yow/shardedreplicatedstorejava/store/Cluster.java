@@ -34,6 +34,20 @@ public final class Cluster {
     private Topology topology;
     private final Map<String, ShardReplicaSet> shardSets = new LinkedHashMap<>();
 
+    /**
+     * 再平衡钩子：新拓扑分片集已激活、未提交残留已清场之后，<strong>正式迁移之前</strong>
+     * 回调（参数为集群自身）。默认空操作；测试用它在“调整中途”注入副本故障/压力。
+     */
+    private java.util.function.Consumer<Cluster> beforeMigrateHook = c -> {
+    };
+
+    /** 安装再平衡迁移前钩子（返回 this 便于链式）。 */
+    public Cluster setBeforeMigrateHook(java.util.function.Consumer<Cluster> hook) {
+        this.beforeMigrateHook = hook == null ? c -> {
+        } : hook;
+        return this;
+    }
+
     public Cluster(Path dataDir, Topology topology) throws IOException {
         this.dataDir = dataDir;
         Files.createDirectories(dataDir);
@@ -169,48 +183,45 @@ public final class Cluster {
         // 新分片的副本集目录此时才创建，旧分片副本集原样保留（可追溯、可重放）。
         activateTopology(newTopology);
 
-        // 2) 按新拓扑归属，对每个新分片做多数派 MIGRATE 写入。
+        // 迁移前对新拓扑下每个分片清掉未提交残留（复用的分片目录里可能留有上一次
+        // 中途失败的在途条目），保证迁移只从干净的已提交位点之后开始。
+        for (ShardRange range : newTopology.ranges()) {
+            shardSets.get(range.shardId()).purgeAllUncommitted();
+        }
+
+        // 迁移前钩子：在“调整中途”注入故障/压力（测试支持，生产为空操作）。
+        beforeMigrateHook.accept(this);
+
+        // 2) 按新拓扑归属，对每个新分片做多数派 MIGRATE 写入。任一键失败都不替换
+        //    拓扑文件，并把内存路由回滚到旧世代：对外仍按旧拓扑读写，已确认数据
+        //    原样保留；失败的 MIGRATE 条目停留在未提交状态（随后可清场重试）。
         int migrated = 0;
         List<String> keysInOrder = new ArrayList<>(committed.keySet());
         keysInOrder.sort(String::compareTo); // 确定的迁移顺序，崩溃后重放也一致
-        for (String key : keysInOrder) {
-            VersionedValue vv = committed.get(key);
-            ShardRange target = newTopology.shardForKey(key);
-            if (target == null) {
-                throw new TopologyException(TopologyViolation.UNCOVERED_HASH_GAP,
-                        "迁移时键 " + key + " 在新拓扑中无归属");
-            }
-            ShardReplicaSet targetSet = shardSets.get(target.shardId());
-            String migrateRequestId = "migrate@" + topology.epoch() + "->"
-                    + newTopology.epoch() + ":" + key;
-            long index = targetSet.leader().lastLogIndex() + 1;
-            LogEntry entry = LogEntry.migrate(index, newTopology.epoch(),
-                    migrateRequestId, key, vv.value(), vv.version());
-
-            int acks = targetSet.leader().append(entry) ? 1 : 0;
-            for (Replica replica : targetSet.replicas()) {
-                if (replica == targetSet.leader()) {
-                    continue;
+        try {
+            for (String key : keysInOrder) {
+                VersionedValue vv = committed.get(key);
+                ShardRange target = newTopology.shardForKey(key);
+                if (target == null) {
+                    throw new TopologyException(TopologyViolation.UNCOVERED_HASH_GAP,
+                            "迁移时键 " + key + " 在新拓扑中无归属");
                 }
-                if (replica.append(entry)) {
-                    acks++;
-                }
+                ShardReplicaSet targetSet = shardSets.get(target.shardId());
+                String migrateRequestId = "migrate@" + oldTopology.epoch() + "->"
+                        + newTopology.epoch() + ":" + key;
+                long index = targetSet.migrateCommitted(migrateRequestId, key,
+                        vv.value(), vv.version(), newTopology.epoch());
+                migrated++;
+                log.info("迁移 key={} version={} -> 新分片={} index={}（判定依据: 已确认状态机快照+新拓扑路由）",
+                        key, vv.version(), target.shardId(), index);
             }
-            if (acks < targetSet.quorum()) {
-                throw new IllegalStateException("迁移未获多数派确认: key=" + key
-                        + " targetShard=" + target.shardId() + " acks=" + acks
-                        + " quorum=" + targetSet.quorum()
-                        + "，拓扑保持旧世代 epoch=" + topology.epoch());
-            }
-            for (Replica replica : targetSet.replicas()) {
-                if (replica.lastLogIndex() >= index && replica.commitIndex() < index) {
-                    replica.setCommitIndex(index);
-                }
-            }
-            migrated++;
-            log.info("迁移 key={} version={} -> 新分片={} index={} acks={}/{}（判定依据: 已确认状态机快照+新拓扑路由）",
-                    key, vv.version(), target.shardId(), index, acks,
-                    targetSet.replicas().size());
+        } catch (RuntimeException e) {
+            // 路由回滚：拓扑文件从未被替换，磁盘仍是旧世代；内存 this.topology
+            // 也切回旧世代，保证重启/继续读写都以旧归属为准，已确认数据不丢不重。
+            this.topology = oldTopology;
+            log.error("再平衡中途失败，已回滚到旧世代 epoch={}（已迁移尝试 {} 键均为未达多数派的在途条目，不可见）: {}",
+                    oldTopology.epoch(), migrated, e.getMessage());
+            throw e;
         }
 
         // 3) 全部迁移完成：staged 新拓扑文件并原子替换。
