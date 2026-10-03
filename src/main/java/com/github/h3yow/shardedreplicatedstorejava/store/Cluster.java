@@ -143,6 +143,10 @@ public final class Cluster {
      *   <li>枚举旧拓扑各分片 leader 状态机中的已确认数据，按新拓扑重新归属；
      *       对每个新分片以 MIGRATE 条目追加并要求多数派确认（版本沿用，不回退、
      *       不重生）；同一逻辑键只迁移一次，杜绝重复；</li>
+     *   <li>同时把每个键名下<strong>全部 requestId 首次结案结论</strong>（成功与
+     *       失败都包含）按键的新归属导入新分片幂等表。这样调整后重提旧 requestId
+     *       仍返回首次结论：失败的永不翻案、失败值永不复活，成功的不重复应用、
+     *       不多出版本/记录；</li>
      *   <li>全部迁移成功后才把新拓扑 staged 并原子替换 topology.txt，对外切换。</li>
      * </ol>
      *
@@ -165,6 +169,10 @@ public final class Cluster {
         //    去枚举分片，旧分片中的已确认数据将被漏迁。
         Topology oldTopology = this.topology;
         Map<String, VersionedValue> committed = new LinkedHashMap<>();
+        // 同时收集每个 key 名下全部已结案的 requestId 首次结论（成功与失败都要）：
+        // 只搬 KV 不搬结论，新分片的幂等表是空的，旧 requestId（尤其失败 requestId）
+        // 重提会被当成全新写入，翻案首次失败结论 / 重复应用首次成功结论。
+        Map<String, List<IdempotencyTable.Settled>> settledByKey = new LinkedHashMap<>();
         for (ShardRange range : oldTopology.ranges()) {
             ShardReplicaSet oldSet = shardSets.get(range.shardId());
             if (oldSet == null) {
@@ -178,7 +186,22 @@ public final class Cluster {
                 }
                 committed.put(e.getKey(), e.getValue());
             }
+            for (IdempotencyTable.Settled settled : oldSet.idempotency().allSettled()) {
+                if (settled.key() == null) {
+                    // 历史版本（key 字段引入前）写入的记录无法按键路由：留在旧分片
+                    // 幂等表中不迁移（旧目录保留），不影响新分片数据一致性。
+                    log.warn("再平衡: requestId={} 的历史结案记录缺少 key，无法按新拓扑路由，保留在旧分片 {}",
+                            settled.requestId(), range.shardId());
+                    continue;
+                }
+                settledByKey.computeIfAbsent(settled.key(), k -> new ArrayList<>()).add(settled);
+            }
         }
+        // 待迁移键集 = 已确认 KV 的键 ∪ 仅有失败/落败结案的键（后者无 KV，
+        // 但其 requestId 结论必须随键到达新分片）。
+        java.util.SortedSet<String> allKeys = new java.util.TreeSet<>();
+        allKeys.addAll(committed.keySet());
+        allKeys.addAll(settledByKey.keySet());
 
         // 新分片的副本集目录此时才创建，旧分片副本集原样保留（可追溯、可重放）。
         activateTopology(newTopology);
@@ -196,31 +219,52 @@ public final class Cluster {
         //    拓扑文件，并把内存路由回滚到旧世代：对外仍按旧拓扑读写，已确认数据
         //    原样保留；失败的 MIGRATE 条目停留在未提交状态（随后可清场重试）。
         int migrated = 0;
-        List<String> keysInOrder = new ArrayList<>(committed.keySet());
-        keysInOrder.sort(String::compareTo); // 确定的迁移顺序，崩溃后重放也一致
+        int conclusionsMoved = 0;
         try {
-            for (String key : keysInOrder) {
-                VersionedValue vv = committed.get(key);
+            for (String key : allKeys) {
                 ShardRange target = newTopology.shardForKey(key);
                 if (target == null) {
                     throw new TopologyException(TopologyViolation.UNCOVERED_HASH_GAP,
                             "迁移时键 " + key + " 在新拓扑中无归属");
                 }
                 ShardReplicaSet targetSet = shardSets.get(target.shardId());
-                String migrateRequestId = "migrate@" + oldTopology.epoch() + "->"
-                        + newTopology.epoch() + ":" + key;
-                long index = targetSet.migrateCommitted(migrateRequestId, key,
-                        vv.value(), vv.version(), newTopology.epoch());
-                migrated++;
-                log.info("迁移 key={} version={} -> 新分片={} index={}（判定依据: 已确认状态机快照+新拓扑路由）",
-                        key, vv.version(), target.shardId(), index);
+
+                // (a) 已确认 KV：以 MIGRATE 条目多数派迁入（版本沿用）。仅有失败/落败
+                //     结案、从无已确认值的键跳过这一步——没有任何可见数据需要迁移。
+                VersionedValue vv = committed.get(key);
+                if (vv != null) {
+                    String migrateRequestId = "migrate@" + oldTopology.epoch() + "->"
+                            + newTopology.epoch() + ":" + key;
+                    long index = targetSet.migrateCommitted(migrateRequestId, key,
+                            vv.value(), vv.version(), newTopology.epoch());
+                    migrated++;
+                    log.info("迁移 key={} version={} -> 新分片={} index={}（判定依据: 已确认状态机快照+新拓扑路由）",
+                            key, vv.version(), target.shardId(), index);
+                }
+
+                // (b) 随键搬迁该 key 名下全部 requestId 的首次结论（成功与失败都搬）。
+                //     导入幂等：再平衡中途失败回滚后重试、或键仍落在同名分片，
+                //     已存在的一致结论跳过，不重复写记录；结论冲突直接拒绝。
+                List<IdempotencyTable.Settled> settledList =
+                        settledByKey.getOrDefault(key, List.of());
+                for (IdempotencyTable.Settled settled : settledList) {
+                    if (targetSet.importSettled(settled)) {
+                        conclusionsMoved++;
+                        log.info("迁移首次结论 requestId={} key={} -> 新分片={} status={} index={} version={}（判定依据: requestId 结论按键归属随迁，不可翻案）",
+                                settled.requestId(), key, target.shardId(),
+                                settled.result().status(),
+                                settled.result().logIndex(), settled.result().version());
+                    }
+                }
             }
         } catch (RuntimeException e) {
             // 路由回滚：拓扑文件从未被替换，磁盘仍是旧世代；内存 this.topology
             // 也切回旧世代，保证重启/继续读写都以旧归属为准，已确认数据不丢不重。
+            // 已导入目标分片幂等表的结论与未达多数派的 MIGRATE 条目一样停留在
+            // “新拓扑未提交”状态：对外路由已回旧分片，重试再平衡时按幂等规则跳过。
             this.topology = oldTopology;
-            log.error("再平衡中途失败，已回滚到旧世代 epoch={}（已迁移尝试 {} 键均为未达多数派的在途条目，不可见）: {}",
-                    oldTopology.epoch(), migrated, e.getMessage());
+            log.error("再平衡中途失败，已回滚到旧世代 epoch={}（已尝试迁移 {} 键、{} 条结论；未达多数派的 MIGRATE 不可见，已导入结论重试时幂等跳过）: {}",
+                    oldTopology.epoch(), migrated, conclusionsMoved, e.getMessage());
             throw e;
         }
 
@@ -229,7 +273,8 @@ public final class Cluster {
         new TopologyManager(staged).save(newTopology);
         topologyManager.commitSwap(staged);
         topology = newTopology;
-        log.info("== 再平衡完成: 已迁移键数={} 当前 epoch={}", migrated, topology.epoch());
+        log.info("== 再平衡完成: 已迁移键数={} 随迁首次结论数={} 当前 epoch={}",
+                migrated, conclusionsMoved, topology.epoch());
         return migrated;
     }
 

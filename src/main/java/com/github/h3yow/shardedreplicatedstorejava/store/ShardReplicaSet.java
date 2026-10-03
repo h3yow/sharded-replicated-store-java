@@ -174,7 +174,7 @@ public final class ShardReplicaSet {
                     requestId, 0, LogEntry.NO_VERSION, 0, quorum,
                     "leader " + leader.replicaId() + " 状态=" + leader.status()
                             + "，写入无法进入日志，区别于确认不足");
-            settle(result);
+            settle(key, result);
             log.warn("[{}] 写入失败 requestId={} REPLICA_UNAVAILABLE（leader={} 状态={}）",
                     shardId, requestId, leader.replicaId(), leader.status());
             return result;
@@ -225,7 +225,7 @@ public final class ShardReplicaSet {
                     "多数派确认: acks=" + acks + " >= quorum=" + quorum
                             + "，提交位点推进到 index=" + index
                             + "，key=" + key + " version=" + version);
-            settle(result);
+            settle(key, result);
             log.info("[{}] 写入提交 requestId={} key={} index={} version={} acks={}/{}（判定依据: 多数派落盘）",
                     shardId, requestId, key, index, version, acks, replicas.size());
             return result;
@@ -245,17 +245,38 @@ public final class ShardReplicaSet {
                         + "条目停留在 index=" + index + " 未提交，对外不可见";
         WriteResult failed = new WriteResult(status, shardId, requestId,
                 index, LogEntry.NO_VERSION, acks, quorum, reason);
-        settle(failed);
+        settle(key, failed);
         log.warn("[{}] 写入未提交 requestId={} key={} index={} acks={}/{} available={} -> {}",
                 shardId, requestId, key, index, acks, replicas.size(), available, status);
         return failed;
     }
 
-    private void settle(WriteResult result) {
+    private void settle(String key, WriteResult result) {
         try {
-            idempotency.put(result);
+            idempotency.put(key, result);
         } catch (IOException e) {
             throw new IllegalStateException("幂等表持久化失败", e);
+        }
+    }
+
+    /** 本分片的 requestId 首次结案表（再平衡迁移按键搬结论用）。 */
+    public IdempotencyTable idempotency() {
+        return idempotency;
+    }
+
+    /**
+     * 再平衡迁移专用：把一条<strong>来自旧分片的已结案 requestId 记录</strong>
+     * （成功或失败的首次结论）导入本分片幂等表。键随记录一起持久化，导入幂等：
+     * 已有完全一致结论则跳过，结论冲突直接拒绝。
+     *
+     * @return true 表示实际新导入；false 表示结论已在而跳过
+     */
+    public boolean importSettled(IdempotencyTable.Settled settled) {
+        try {
+            return idempotency.importIfAbsent(settled);
+        } catch (IOException e) {
+            throw new IllegalStateException("幂等表迁移导入失败: requestId="
+                    + settled.requestId(), e);
         }
     }
 

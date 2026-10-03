@@ -7,6 +7,11 @@
 - **重复提交**幂等、不重复应用、不版本回退；
 - **写失败后可用新请求标识安全重提**：失败值永不复活，重提版本严格更大；失败的旧
   requestId 永远保留首次结论，重提它不会变成新提交、也不会重复应用；
+- **安全重提结论在分片归属调整（再平衡）前后一致**：再平衡把每个键名下全部 requestId
+  的首次结论（成功与失败都含）随键一起搬到新分片。键被调到别的分片后，重提旧
+  requestId 仍返回首次结论——失败的永不翻案、失败值在迁移/重启/追赶后都不被任何
+  读取看到；成功的不重复应用、不多出版本或记录；再平衡后换新 requestId 重提，
+  版本严格大于此前所有已确认版本；
 - **普通写入路径（无需声明批大小）同键并发决胜**：同批并发最终胜出值只由请求内容
   （requestId）决定，与线程调度/到达先后/副本处理顺序无关；赢家 COMMITTED、落败者
   SUPERSEDED，结论可区分；
@@ -34,7 +39,7 @@
 | `Replica` | 单个分片副本：日志 + 状态机 + 提交位点 + 可用性模拟 + 重启恢复 |
 | `ReplicaCatchup` | 在线同步（只追加缺失后缀）与恢复性追赶（截断分叉/损坏后对齐） |
 | `ShardReplicaSet` | 一个分片的多数派写入协调、requestId 幂等、提交传播、安全重提清场、同键决胜 |
-| `IdempotencyTable` | requestId -> 首次结论的持久化去重表（含 COMMITTED/SUPERSEDED/失败） |
+| `IdempotencyTable` | requestId -> (所属 key + 首次结论) 的持久化去重表（含 COMMITTED/SUPERSEDED/失败）；再平衡时按 key 把结论随迁到新分片 |
 | `DeterministicLock` | 互斥 + 批量严格全序（按 requestId 排序放行），供显式批次接口使用 |
 | `KeyContestGate` | 普通写入路径的同键并发决胜闸门（**无需声明批大小**，探测+收集两段式自动成批） |
 | `Cluster` | 门面：路由写入/读取、再平衡编排（含中途失败回滚）、整集群重启、副本追赶 |
@@ -46,7 +51,7 @@
 <dataDir>/
   topology.txt                 当前世代拓扑（原子替换）
   <shardId>/
-    idempotency.txt            requestId 首次结案表
+    idempotency.txt            requestId 首次结案表（每条含所属 key，再平衡时随键搬迁）
     <replicaId>/log.txt        追加日志（每行带 CRC32）
     <replicaId>/commit.txt     提交位点（一个数字）
 ```
@@ -107,16 +112,47 @@
 
 > 失败条目与已确认条目的唯一分界是多数派提交位点；截断只动 `index > commitIndex` 的
 > 部分，已确认数据不丢、不重。
+>
+> **这条结论跨再平衡仍然成立**（见 2.3 与第 3 节）：requestId 的首次结论连同所属 key
+> 一起持久化，再平衡时随键搬迁。因此键被调到别的分片后，重提旧的失败 requestId 依旧
+> 得到 `DUPLICATE(首次失败)`，失败值不会借迁移“换个分片复活”。
 
 ### 2.3 幂等与版本
 
-- `requestId -> 首次 WriteResult` 持久化在每分片的 `idempotency.txt`。
+- 每条结案记录持久化为 `requestId -> (所属 key, 首次 WriteResult)`，存放在该键当前
+  归属分片的 `idempotency.txt`（制表符分隔、Base64 编码；旧版本无 `key` 字段的行仍可
+  读取，但无法按键随迁，会保留在旧分片目录中）。
 - 重复提交（无论首次是成功还是失败、无论重试时携带什么 value）都返回首次结论，
   **不产生第二条日志、不重复应用、不回退版本**。
 - 每个键的 `version` 在状态机内单调递增：
   - 更大 version 才覆盖；
   - 相同 version（重复迁移）幂等忽略；
   - 更小 version 直接抛错，杜绝回退。
+
+#### 2.3.1 安全重提在分片归属调整前后的语义
+
+requestId 的首次结论是**按键归属**的，再平衡（`Cluster.reshard`）在迁移已确认 KV 的
+同时，把每个 key 名下**全部已结案 requestId**（成功、落败、失败都包含）按新拓扑导入
+归属新分片的幂等表。由此，无论首次结论是成功还是失败：
+
+- **调整前重提**：命中旧分片幂等表，返回首次结论；
+- **调整后（键已调到别的分片）重提**：命中新分片幂等表中随迁而来的同一条结论，
+  返回**同一个**首次结论（`DUPLICATE`，携带首次的 status/index/version），不会因为
+  换了分片、空表而被当成全新写入；
+- 首次**失败**的 requestId 永远不能翻案成成功提交，失败那轮的值只可能是未提交残留，
+  从不随 `MIGRATE`（只迁已确认快照）流动，迁移/重启/落后副本追赶之后都不被任何读取
+  看到；
+- 首次**成功**的 requestId 不二次应用，不多出一个新版本、不多写一条日志记录；
+- 再平衡之后若用**新** requestId 重写同一 key，新版本从新分片 leader 已应用版本
+  （即迁移沿用的已确认版本）连续 +1，**严格大于此前所有已确认版本**，无重复/跳号/回退。
+
+导入是**幂等**的：同一 requestId 且首次结论（status/index/version）一致则跳过，所以
+“再平衡走到一半失败、回滚后用相同参数重试”以及“键仍落在同名分片”都不会重复写结论；
+若同一 requestId 在目标分片已有**互相冲突**的结论，直接抛错，绝不静默覆盖首次结论。
+
+> 与批量写入的兼容：普通 `write`（含 `KeyContestGate` 自动决胜）与显式批次
+> `writeInBatch` 走的是同一张幂等表、同一套随迁规则，因此 `SUPERSEDED` 落败结论、
+> `COMMITTED` 赢家结论与失败结论在再平衡前后的行为完全一致，既有批量用法无需改动。
 
 ### 2.4 同键并发写入的确定性决胜
 
@@ -168,18 +204,23 @@
 1. 用新区间/副本构造 `Topology(epoch+1)` 并先做合法性校验：重叠、空洞、越界、
    非法副本集一律拒绝，旧拓扑与旧数据保持不变；世代号必须递增，防止旧拓扑回滚。
 2. 在切换 `this.topology` **之前**枚举旧拓扑各分片 leader 状态机中的**已确认**快照
-   （只含已提交数据，未提交条目不迁移）。
+   （只含已提交数据，未提交条目不迁移），同时收集每个分片幂等表中全部
+   `requestId -> (key, 首次结论)` 记录，按 key 归组。
 3. 打开新分片副本集；对每个新分片先 `purgeAllUncommitted()` 清掉可能复用的目录里
-   上一次失败迁移/失败写留下的未提交后缀，再按新拓扑把每个键路由到新分片，通过
-   `ShardReplicaSet.migrateCommitted(...)` 以 `MIGRATE` 日志条目追加，并要求
-   **新分片多数派确认**；迁移沿用原值与原 version（不重生版本、不回退）。
-   键按字典序迁移，保证崩溃后重放顺序一致；同一逻辑键只迁移一次。
+   上一次失败迁移/失败写留下的未提交后缀，再按键的字典序统一处理（确定的顺序，崩溃后
+   重放一致），对每个 key：
+   1. 若该 key 有已确认值，通过 `ShardReplicaSet.migrateCommitted(...)` 以 `MIGRATE`
+      日志条目追加并要求**新分片多数派确认**；沿用原值与原 version（不重生版本、不
+      回退）；同一逻辑键只迁移一次。只有失败/落败结案、从无已确认值的键跳过这一步。
+   2. 通过 `ShardReplicaSet.importSettled(...)` 把该 key 名下**全部 requestId 首次
+      结论**导入新分片幂等表（成功与失败都导入；导入幂等、冲突即拒绝）。
 4. 全部键迁移成功后，新拓扑写入 `*.staged` 临时文件，再 `ATOMIC_MOVE` 替换
    `topology.txt`，对外原子切换世代。
 5. **中途任一步失败都不会替换拓扑文件**，并且内存路由会**回滚到旧世代**：对外仍按
    旧拓扑读写，旧分片的已确认数据原样保留（不丢、不重），失败的 `MIGRATE` 条目停留
-   在未提交状态、不可见；副本恢复后用相同参数重新 `reshard` 即可成功。旧分片目录
-   保留不删，迁移过程可追溯、可重放。
+   在未提交状态、不可见；已经导入新分片幂等表的结论因为对外路由已切回旧分片而不可达，
+   重试再平衡时会按幂等规则跳过、不重复写入。副本恢复后用相同参数重新 `reshard`
+   即可成功。旧分片目录保留不删，迁移过程可追溯、可重放。
 
 由此保证：调整过程中或调整压力下**已确认数据不丢失、不重复、不会落到错误分片**；
 失败迁移与失败普通写入一样，其值不会在任何后续同步/重启/追赶中复活。
@@ -249,11 +290,12 @@ mvn test -Dtest=WriteConsensusTest                 # 多数派、确认不足/�
 mvn test -Dtest=LogRecoveryTest                    # 截断/缺号/乱序/校验和损坏、停点、追赶
 mvn test -Dtest=ConcurrentWriteTest                # 【显式批次】同键并发写入最终版本确定可复现
 mvn test -Dtest=SafeRetryAfterFailureTest          # 【新】失败后换新 requestId 安全重提
+mvn test -Dtest=SafeRetryAcrossReshardTest         # 【新】再平衡前后旧 requestId 重提（失败/成功两种结论）、回滚重试、重启追赶、版本严格递增
 mvn test -Dtest=OrdinaryPathContentionTest         # 【新】普通接口（无需批次）同键并发决胜
 mvn test -Dtest=RestartReshardConsistencyTest      # 【新】重启+再平衡+追赶后最终一致、失败再平衡不毁数据
 ```
 
-测试位于 `src/test/java/.../tests/`，共 7 类 22 个用例，使用 JUnit 5 临时目录，
+测试位于 `src/test/java/.../tests/`，共 8 类 27 个用例，使用 JUnit 5 临时目录，
 不落任何外部状态。**单测日志会打印位点（index/commit）、版本（version）、决胜位
 （position）与判定依据**，例如：
 
@@ -264,6 +306,9 @@ mvn test -Dtest=RestartReshardConsistencyTest      # 【新】重启+再平衡+�
 [判定依据] 唯一赢家=req-16（15 个落败者 SUPERSEDED 可区分，不存在'拿成功却读到别人值'）
 [s1][r1] 日志损坏，恢复停在 index=4，原因=TRUNCATED_ENTRY ...
 [判定依据] 失败 requestId 重提 -> DUPLICATE(首次=REPLICA_UNAVAILABLE) ...，无新日志、不重复应用
+迁移首次结论 requestId=req-fail key=failkey-7 -> 新分片=n2 status=REPLICA_UNAVAILABLE ...（判定依据: requestId 结论按键归属随迁，不可翻案）
+[判定依据] 再平衡后旧失败 requestId 重提 -> DUPLICATE(首次=REPLICA_UNAVAILABLE) index=2，未翻案、未应用，读仍 v2-good/2
+[版本] 再平衡后新 requestId=v3-req 提交 version=3（严格 > 迁移沿用版本 2）
 ```
 
 普通路径决胜窗口可用系统属性在压测/复现时调整（默认探测 2ms、收集 40ms）：
@@ -292,6 +337,11 @@ mvn test -Dtest=OrdinaryPathContentionTest \
 | **决胜结果扛重启** | `OrdinaryPathContentionTest.finalValueVersionAndShardSurviveRestart` | 重启后最终值/版本/分片不变；落败 requestId 重提仍 `DUPLICATE` |
 | **重启+再平衡+追赶最终一致** | `RestartReshardConsistencyTest.winnerVersionAndShardRemainStableAcrossRestartReshardAndCatchup` | 赢家值/版本/归属跨流程一致，失败值不复活，落后副本追赶到赢家 |
 | **再平衡中途失败不毁数据** | `RestartReshardConsistencyTest.failedReshardKeepsCommittedDataUntouchedAndCanRetrySuccessfully` | 拓扑保持旧世代、已确认数据原样；恢复后重提再平衡成功 |
+| **再平衡后旧失败 requestId 不翻案** | `SafeRetryAcrossReshardTest.failedFirstConclusionStaysFailedAfterReshardAndFailedValueNeverResurfaces` | 键迁到新分片后重提仍 `DUPLICATE(首次失败)`；失败值迁移/重启/追赶后均不可见、不新增日志 |
+| **再平衡后旧成功 requestId 不重复应用** | `SafeRetryAcrossReshardTest.committedFirstConclusionStaysCommittedAfterReshardWithoutExtraVersionOrRecord` | 重提仍 `DUPLICATE(首次成功 index/ver)`，版本不增、日志不多一条 |
+| **再平衡失败回滚重试后结论一致** | `SafeRetryAcrossReshardTest.reshardFailureRollbackThenRetryPreservesAllConclusions` | 回滚期间结论不变；重试成功后失败/成功 requestId 均 `DUPLICATE`，失败值不存在 |
+| **无已确认值的键失败结论随迁** | `SafeRetryAcrossReshardTest.failedOnlyKeyWithoutCommittedValueCarriesFailureConclusionAcrossReshard` | 迁移键数=0 但失败结论随键搬迁，重提仍 `DUPLICATE(失败)`，值永不冒头 |
+| **再平衡后新版本严格递增** | `SafeRetryAcrossReshardTest.newRequestIdAfterReshardGetsVersionStrictlyGreaterThanAllCommitted` | 迁移沿用版本 2 之后新 requestId 得 version=3，重启后继续 4，无重复/跳号/回退 |
 | 截断日志 | `LogRecoveryTest.truncatedLastEntryStopsRecoveryAtLastConsistentIndex` | 停点=4，追赶后到 5 |
 | 缺号/乱序 | `missingIndexAndOutOfOrderAreDetectedAtCorrectStopPoint` | 分别 `MISSING_INDEX` / `INDEX_OUT_OF_ORDER` |
 | 校验和损坏 | `checksumMismatchIsDetectedAndNeverApplied` | `CHECKSUM_MISMATCH`，被篡改条目不应用 |
@@ -315,3 +365,8 @@ mvn test -Dtest=OrdinaryPathContentionTest \
 - “失败值绝不复活”通过“提交位点之上的未提交后缀在每次写入/迁移/对齐前物理截断”实现；
   这是单 leader、同 term 不在已提交区间分叉这一不变量下的简化，真实 Raft 类系统还会
   结合 term/Leader 变更与日志一致性检查。
+- “requestId 首次结论跨再平衡不变”通过“结论随 key 持久化并在再平衡时按键导入新分片
+  幂等表”实现（本地文件即权威去重存储）。真实分布式系统通常把幂等记录放进随分片
+  迁移的一致性状态（如与分片日志同进同出），并用 Raft 多数派而非单机文件保证其
+  持久性；这里只模拟单机落盘与随迁编排。历史版本（无 key 字段）幂等表行可读但不随迁，
+  保留在旧分片目录。
