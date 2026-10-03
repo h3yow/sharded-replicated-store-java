@@ -45,6 +45,18 @@ public final class ShardReplicaSet {
 
     public ShardReplicaSet(String shardId, List<String> replicaIds,
                            long term, Path dataDir) throws IOException {
+        this(shardId, replicaIds, term, dataDir,
+                new IdempotencyTable(dataDir.resolve("idempotency.txt")));
+    }
+
+    /**
+     * @param idempotency 集群级共享的 requestId 首次结案表：requestId 结论与分片归属
+     *                    无关，再平衡把键调到别的分片后，旧 requestId 重提仍必须查到
+     *                    首次结论，因此该表由 {@link Cluster} 持有并注入所有分片。
+     */
+    public ShardReplicaSet(String shardId, List<String> replicaIds,
+                           long term, Path dataDir, IdempotencyTable idempotency)
+            throws IOException {
         this.shardId = shardId;
         this.term = term;
         this.shardDir = dataDir.resolve(shardId);
@@ -55,7 +67,7 @@ public final class ShardReplicaSet {
         }
         this.leader = replicas.get(replicaIds.get(0));
         this.quorum = replicaIds.size() / 2 + 1;
-        this.idempotency = new IdempotencyTable(shardDir.resolve("idempotency.txt"));
+        this.idempotency = idempotency;
         log.info("初始化分片 {} term={} 副本数={} 多数派={} leader={}",
                 shardId, term, replicaIds.size(), quorum, leader.replicaId());
     }

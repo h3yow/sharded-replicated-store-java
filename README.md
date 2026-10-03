@@ -6,7 +6,8 @@
 - 写入在**多数派副本确认**后才对外可见；
 - **重复提交**幂等、不重复应用、不版本回退；
 - **写失败后可用新请求标识安全重提**：失败值永不复活，重提版本严格更大；失败的旧
-  requestId 永远保留首次结论，重提它不会变成新提交、也不会重复应用；
+  requestId 永远保留首次结论，重提它不会变成新提交、也不会重复应用——**分片归属
+  调整（再平衡）、重启、追赶之后同样成立**（requestId 结论是集群级不变量，见 2.2.2）；
 - **普通写入路径（无需声明批大小）同键并发决胜**：同批并发最终胜出值只由请求内容
   （requestId）决定，与线程调度/到达先后/副本处理顺序无关；赢家 COMMITTED、落败者
   SUPERSEDED，结论可区分；
@@ -34,7 +35,7 @@
 | `Replica` | 单个分片副本：日志 + 状态机 + 提交位点 + 可用性模拟 + 重启恢复 |
 | `ReplicaCatchup` | 在线同步（只追加缺失后缀）与恢复性追赶（截断分叉/损坏后对齐） |
 | `ShardReplicaSet` | 一个分片的多数派写入协调、requestId 幂等、提交传播、安全重提清场、同键决胜 |
-| `IdempotencyTable` | requestId -> 首次结论的持久化去重表（含 COMMITTED/SUPERSEDED/失败） |
+| `IdempotencyTable` | requestId -> 首次结论的持久化去重表（集群级单文件，含 COMMITTED/SUPERSEDED/失败；跨再平衡生效） |
 | `DeterministicLock` | 互斥 + 批量严格全序（按 requestId 排序放行），供显式批次接口使用 |
 | `KeyContestGate` | 普通写入路径的同键并发决胜闸门（**无需声明批大小**，探测+收集两段式自动成批） |
 | `Cluster` | 门面：路由写入/读取、再平衡编排（含中途失败回滚）、整集群重启、副本追赶 |
@@ -45,11 +46,14 @@
 ```
 <dataDir>/
   topology.txt                 当前世代拓扑（原子替换）
+  idempotency.txt              requestId 首次结案表（集群级，跨分片归属调整生效）
   <shardId>/
-    idempotency.txt            requestId 首次结案表
     <replicaId>/log.txt        追加日志（每行带 CRC32）
     <replicaId>/commit.txt     提交位点（一个数字）
 ```
+
+> 兼容：旧版按分片存放的 `<shardId>/idempotency.txt` 在集群（重）打开时自动合并进
+> 集群级结案表（已存在的 requestId 保留集群级首次结论），旧数据目录的结案信息不丢。
 
 ---
 
@@ -108,11 +112,31 @@
 > 失败条目与已确认条目的唯一分界是多数派提交位点；截断只动 `index > commitIndex` 的
 > 部分，已确认数据不丢、不重。
 
+#### 2.2.2 安全重提规则在分片归属调整（再平衡）前后的语义
+
+requestId 的首次结论是**集群级不变量**，与键当前归属哪个分片无关：
+
+- 幂等结案表是**集群级单文件**（`<dataDir>/idempotency.txt`），由 `Cluster` 持有并
+  注入所有分片副本集；再平衡只迁移键值数据，**不搬动、不清空** requestId 结论。
+- 因此无论首次结论是**失败**还是**成功**，同一 requestId 在调整前、调整后（包括该键
+  被调到别的分片）重提，都得到 `DUPLICATE(首次结论)`：失败结论不会变成新的成功提交，
+  成功结论不会重复应用出新版本/新日志；失败那轮的值在任何后续同步、重启、追赶、
+  调整中都不会被任何读取看到。
+- 该不变量同样扛住边界路径：再平衡**中途失败回滚**（拓扑保持旧世代，结论原地保留）、
+  回滚后**重试再平衡**、**整集群重启重放**（结案表随数据目录持久化）、落后副本
+  **追赶**（追赶只搬日志条目，不触碰结案表）。
+- 换新 requestId 重提成功时，版本从已提交位点连续分配，**严格大于此前所有已确认
+  版本**，不允许重复、跳号或回退（见 2.2.1 的清场规则）。
+- 与批量写入用法的兼容范围：普通路径（`Cluster.write`）与显式批次路径
+  （`Cluster.writeInBatch`）共用同一张集群级结案表与同一套清场规则，上述语义对
+  两条路径同等适用；既有批量调用的签名与行为不变。
+
 ### 2.3 幂等与版本
 
-- `requestId -> 首次 WriteResult` 持久化在每分片的 `idempotency.txt`。
-- 重复提交（无论首次是成功还是失败、无论重试时携带什么 value）都返回首次结论，
-  **不产生第二条日志、不重复应用、不回退版本**。
+- `requestId -> 首次 WriteResult` 持久化在**集群级** `idempotency.txt`（见 2.2.2：
+  跨分片归属调整生效；旧版按分片的结案文件在集群打开时自动合并进来）。
+- 重复提交（无论首次是成功还是失败、无论重试时携带什么 value、无论键已被调到
+  哪个分片）都返回首次结论，**不产生第二条日志、不重复应用、不回退版本**。
 - 每个键的 `version` 在状态机内单调递增：
   - 更大 version 才覆盖；
   - 相同 version（重复迁移）幂等忽略；
@@ -183,6 +207,8 @@
 
 由此保证：调整过程中或调整压力下**已确认数据不丢失、不重复、不会落到错误分片**；
 失败迁移与失败普通写入一样，其值不会在任何后续同步/重启/追赶中复活。
+requestId 首次结论存放在集群级结案表（2.2.2），再平衡不搬动它，因此调整前后
+重提同一 requestId（无论首次成功或失败）结论不变、不重复应用。
 
 > 测试支持：`Cluster.setBeforeMigrateHook(Consumer<Cluster>)` 在“新分片已激活、
 > 正式迁移之前”回调，用于在调整中途注入副本故障/压力（生产默认为空操作）。
@@ -251,9 +277,18 @@ mvn test -Dtest=ConcurrentWriteTest                # 【显式批次】同键并
 mvn test -Dtest=SafeRetryAfterFailureTest          # 【新】失败后换新 requestId 安全重提
 mvn test -Dtest=OrdinaryPathContentionTest         # 【新】普通接口（无需批次）同键并发决胜
 mvn test -Dtest=RestartReshardConsistencyTest      # 【新】重启+再平衡+追赶后最终一致、失败再平衡不毁数据
+mvn test -Dtest=SafeRetryAcrossReshardTest         # 【新】再平衡前后重提旧 requestId（成功/失败结论）不重复应用
 ```
 
-测试位于 `src/test/java/.../tests/`，共 7 类 22 个用例，使用 JUnit 5 临时目录，
+本地复现“调整后重提旧 requestId”场景的最小路径：
+
+```bash
+# 复现修复前缺陷：再平衡只迁移键值、不迁移 requestId 结论，旧 requestId 在新分片被当成新写入。
+# 修复后以下用例全部通过；日志会打印位点(index/commit)、版本(version)与判定依据。
+mvn test -Dtest=SafeRetryAcrossReshardTest
+```
+
+测试位于 `src/test/java/.../tests/`，共 8 类 26 个用例，使用 JUnit 5 临时目录，
 不落任何外部状态。**单测日志会打印位点（index/commit）、版本（version）、决胜位
 （position）与判定依据**，例如：
 
@@ -292,6 +327,10 @@ mvn test -Dtest=OrdinaryPathContentionTest \
 | **决胜结果扛重启** | `OrdinaryPathContentionTest.finalValueVersionAndShardSurviveRestart` | 重启后最终值/版本/分片不变；落败 requestId 重提仍 `DUPLICATE` |
 | **重启+再平衡+追赶最终一致** | `RestartReshardConsistencyTest.winnerVersionAndShardRemainStableAcrossRestartReshardAndCatchup` | 赢家值/版本/归属跨流程一致，失败值不复活，落后副本追赶到赢家 |
 | **再平衡中途失败不毁数据** | `RestartReshardConsistencyTest.failedReshardKeepsCommittedDataUntouchedAndCanRetrySuccessfully` | 拓扑保持旧世代、已确认数据原样；恢复后重提再平衡成功 |
+| **调整后重提失败 requestId** | `SafeRetryAcrossReshardTest.failedRequestIdRetriedAfterReshardKeepsFirstFailureVerdict` | `DUPLICATE(首次失败)`，失败值永不复活，可见值/版本不变 |
+| **调整后重提成功 requestId** | `SafeRetryAcrossReshardTest.committedRequestIdRetriedAfterReshardKeepsFirstSuccessVerdict` | `DUPLICATE(首次成功)`，不产生新版本/新日志 |
+| **重启+再平衡+追赶后重提** | `SafeRetryAcrossReshardTest.verdictsSurviveRestartReshardAndCatchup` | 两旧 requestId 均复用首次结论；新 requestId 版本严格更大 |
+| **调整中途失败回滚再重试** | `SafeRetryAcrossReshardTest.verdictsStableWhenReshardFailsMidwayAndIsRetried` | 回滚前后、重试再平衡后结论均不变，失败值不复活 |
 | 截断日志 | `LogRecoveryTest.truncatedLastEntryStopsRecoveryAtLastConsistentIndex` | 停点=4，追赶后到 5 |
 | 缺号/乱序 | `missingIndexAndOutOfOrderAreDetectedAtCorrectStopPoint` | 分别 `MISSING_INDEX` / `INDEX_OUT_OF_ORDER` |
 | 校验和损坏 | `checksumMismatchIsDetectedAndNeverApplied` | `CHECKSUM_MISMATCH`，被篡改条目不应用 |

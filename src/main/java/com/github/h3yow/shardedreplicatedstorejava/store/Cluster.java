@@ -19,11 +19,15 @@ import java.util.Map;
  * <pre>
  * dataDir/
  *   topology.txt                 当前世代拓扑（原子替换）
+ *   idempotency.txt              requestId 首次结案表（集群级，跨分片归属调整生效）
  *   &lt;shardId&gt;/
- *     idempotency.txt            requestId 首次结案表
  *     &lt;replicaId&gt;/log.txt        追加日志（带校验和）
  *     &lt;replicaId&gt;/commit.txt     提交位点
  * </pre>
+ *
+ * <p>requestId 的首次结论是<strong>集群级不变量</strong>：再平衡只迁移键值数据，
+ * 旧 requestId 重提可能被路由到另一个分片，因此结案表必须放在集群级单文件中，
+ * 由本分片集合共享；否则旧 requestId 会在新分片被当成全新写入重复应用。</p>
  */
 public final class Cluster {
 
@@ -31,6 +35,7 @@ public final class Cluster {
 
     private final Path dataDir;
     private final TopologyManager topologyManager;
+    private final IdempotencyTable idempotency;
     private Topology topology;
     private final Map<String, ShardReplicaSet> shardSets = new LinkedHashMap<>();
 
@@ -52,15 +57,18 @@ public final class Cluster {
         this.dataDir = dataDir;
         Files.createDirectories(dataDir);
         this.topologyManager = new TopologyManager(dataDir.resolve("topology.txt"));
+        this.idempotency = new IdempotencyTable(dataDir.resolve("idempotency.txt"));
         TopologyValidator.validate(topology);
         this.topology = topology;
         topologyManager.save(topology);
         activateTopology(topology);
+        mergeLegacyShardIdempotency();
     }
 
     private Cluster(Path dataDir) throws IOException {
         this.dataDir = dataDir;
         this.topologyManager = new TopologyManager(dataDir.resolve("topology.txt"));
+        this.idempotency = new IdempotencyTable(dataDir.resolve("idempotency.txt"));
     }
 
     /** 从磁盘恢复整个集群：读取拓扑，打开所有分片副本集（副本构造时即重放）。 */
@@ -68,7 +76,36 @@ public final class Cluster {
         Cluster cluster = new Cluster(dataDir);
         cluster.topology = cluster.topologyManager.load();
         cluster.activateTopology(cluster.topology);
+        cluster.mergeLegacyShardIdempotency();
         return cluster;
+    }
+
+    /**
+     * 兼容旧版按分片存放的 {@code <shardId>/idempotency.txt}：集群（重）打开时把
+     * 各分片目录下尚未结案的 requestId 记录合并进集群级结案表。已存在于集群级表的
+     * requestId 保留集群级首次结论，不覆盖。旧分片目录在再平衡后保留不删，因此
+     * 重启重放时旧世代分片的结论同样能被继承。
+     */
+    private void mergeLegacyShardIdempotency() throws IOException {
+        try (var stream = Files.list(dataDir)) {
+            for (Path child : stream.filter(Files::isDirectory).toList()) {
+                Path legacy = child.resolve("idempotency.txt");
+                if (!Files.exists(legacy)) {
+                    continue;
+                }
+                IdempotencyTable shardTable = new IdempotencyTable(legacy);
+                int merged = 0;
+                for (WriteResult record : shardTable.records()) {
+                    if (idempotency.mergeIfAbsent(record)) {
+                        merged++;
+                    }
+                }
+                if (merged > 0) {
+                    log.info("兼容合并: 旧分片结案表 {} 并入集群级结案表 {} 条（判定依据: requestId 首次结论随键跨分片生效）",
+                            legacy, merged);
+                }
+            }
+        }
     }
 
     /** 为拓扑中的每个分片构建/打开副本集。老世代分片目录保留不删（迁移可追溯）。 */
@@ -78,7 +115,8 @@ public final class Cluster {
             String shardId = range.shardId();
             if (!shardSets.containsKey(shardId)) {
                 shardSets.put(shardId, new ShardReplicaSet(shardId,
-                        newTopology.replicasOf(shardId), newTopology.epoch(), dataDir));
+                        newTopology.replicasOf(shardId), newTopology.epoch(), dataDir,
+                        idempotency));
             }
         }
     }

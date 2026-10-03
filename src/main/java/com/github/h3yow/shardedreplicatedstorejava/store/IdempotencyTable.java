@@ -16,9 +16,15 @@ import java.util.Map;
 /**
  * requestId -> 首次 {@link WriteResult} 的持久化去重表。
  *
- * <p>每个分片一个文件，每行一条已结案的写入（含成功与失败——失败也占用 requestId，
- * 保证同一 requestId 重试不会得到互相矛盾的结论）。文件格式为制表符分隔，
- * 字符串字段 Base64 编码，与日志行同样要求可逐行解析。</p>
+ * <p><strong>集群级单文件</strong>（{@code <dataDir>/idempotency.txt}）：requestId 的
+ * 首次结论是集群级不变量，与键当前归属哪个分片无关。分片归属调整（再平衡）只迁移
+ * 键值数据，requestId 结论必须原地保留并继续生效——否则旧 requestId 被路由到新分片
+ * 后会查不到首次结论，被当成全新写入重复应用。每行一条已结案的写入（含成功与失败
+ * ——失败也占用 requestId，保证同一 requestId 重试不会得到互相矛盾的结论）。
+ * 文件格式为制表符分隔，字符串字段 Base64 编码，与日志行同样要求可逐行解析。</p>
+ *
+ * <p>兼容：旧版按分片存放的 {@code <shardId>/idempotency.txt} 在集群打开时由
+ * {@link Cluster} 合并进本表（见 {@link #mergeIfAbsent}），结论不丢。</p>
  */
 public final class IdempotencyTable {
 
@@ -50,6 +56,30 @@ public final class IdempotencyTable {
 
     public synchronized WriteResult get(String requestId) {
         return table.get(requestId);
+    }
+
+    /** 当前全部已结案记录（只读快照，供旧版分片级文件合并枚举）。 */
+    public synchronized java.util.List<WriteResult> records() {
+        return java.util.List.copyOf(table.values());
+    }
+
+    /**
+     * 合并一条来自旧版分片级幂等表的记录：仅当 requestId 尚未结案时补登并持久化，
+     * 已存在则保留本表首次结论（不覆盖、不抛错）。
+     *
+     * @return true 表示本条是新补登的
+     */
+    public synchronized boolean mergeIfAbsent(WriteResult result) throws IOException {
+        if (table.containsKey(result.requestId())) {
+            return false;
+        }
+        try (BufferedWriter w = Files.newBufferedWriter(file, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
+            w.write(serialize(result));
+            w.newLine();
+        }
+        table.put(result.requestId(), result);
+        return true;
     }
 
     /** 仅在首次见到该 requestId 时结案；并发重复提交由副本集的有序锁挡住。 */
